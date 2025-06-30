@@ -1,0 +1,23 @@
+/**:
+  ros__parameters:
+    # Joystick axis mapping - CORRECTED for Logitech F310 actual layout
+    axis_linear_x: 1      # Left stick Y-axis (forward/backward) 
+    axis_linear_y: 0      # Left stick X-axis (left/right strafe)
+    axis_angular_z: 3     # Right stick X-axis (rotation) - CORRECTED from 2 to 3!
+    
+    # Button mapping - matching embedded_joystick_control style
+    button_deadman: 5     # Right bumper (RB) - must hold to enable movement
+    button_turbo: 4       # Left bumper (LB) - turbo speed
+    button_slow: 6        # Back button - slow speed  
+    button_estop: 7       # Start button - emergency stop
+    
+    # Speed parameters
+    max_linear_velocity: 2.0     # m/s maximum linear speed
+    max_angular_velocity: 3.0    # rad/s maximum angular speed
+    turbo_multiplier: 1.5        # Speed multiplier in turbo mode
+    slow_multiplier: 0.3         # Speed multiplier in slow mode
+    deadzone_threshold: 0.1      # Joystick deadzone
+    
+    # Control parameters
+    cmd_vel_timeout: 0.2         # seconds before stopping if no input
+    publish_rate: 20.0           # Hz command publishing rate

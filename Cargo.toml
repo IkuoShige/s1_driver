@@ -1,0 +1,16 @@
+[package]
+name = "s1_driver_rust"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "s1_driver_rust"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+robomaster-rust = { path = "../robomaster-rust" }
+tokio = { version = "1.0", features = ["full"] }
+anyhow = "1.0"
+
+[build-dependencies]
+cbindgen = "0.24"

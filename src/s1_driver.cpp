@@ -11,7 +11,7 @@ namespace s1_driver
 S1Driver::S1Driver() : Node("s1_driver")
 {
   // Declare parameters
-  this->declare_parameter<std::string>("can_interface", "can0");
+  this->declare_parameter<std::string>("can_interface", "can2");
   this->declare_parameter<std::string>("base_frame", "base_link");
   this->declare_parameter<std::string>("odom_frame", "odom");
   this->declare_parameter<double>("control_frequency", 50.0);

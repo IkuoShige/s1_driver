@@ -8,7 +8,7 @@ name = "s1_driver_rust"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-robomaster-rust = { path = "../robomaster-rust" }
+robomaster-rust = { path = "../robomaster_s1_rust" }
 tokio = { version = "1.0", features = ["full"] }
 anyhow = "1.0"
 

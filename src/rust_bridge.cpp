@@ -59,8 +59,53 @@ bool RustBridge::readSensors(SensorData& data)
   if (!isValidHandle() || !is_initialized_) {
     return false;
   }
-  
+
   return rust_bridge_read_sensor_data(handle_id_) != 0;
+}
+
+bool RustBridge::getEscData(EscData& data)
+{
+  if (!isValidHandle() || !is_initialized_) {
+    return false;
+  }
+
+  return rust_bridge_get_esc_data(handle_id_, &data) != 0;
+}
+
+bool RustBridge::getImuData(ImuData& data)
+{
+  if (!isValidHandle() || !is_initialized_) {
+    return false;
+  }
+
+  return rust_bridge_get_imu_data_new(handle_id_, &data) != 0;
+}
+
+bool RustBridge::getVelocityData(VelocityData& data)
+{
+  if (!isValidHandle() || !is_initialized_) {
+    return false;
+  }
+
+  return rust_bridge_get_velocity_data(handle_id_, &data) != 0;
+}
+
+bool RustBridge::getPositionData(PositionData& data)
+{
+  if (!isValidHandle() || !is_initialized_) {
+    return false;
+  }
+
+  return rust_bridge_get_position_data(handle_id_, &data) != 0;
+}
+
+bool RustBridge::getAttitudeData(AttitudeData& data)
+{
+  if (!isValidHandle() || !is_initialized_) {
+    return false;
+  }
+
+  return rust_bridge_get_attitude_data(handle_id_, &data) != 0;
 }
 
 bool RustBridge::setLed(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness)

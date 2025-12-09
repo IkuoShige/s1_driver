@@ -55,12 +55,47 @@ public:
   bool stop();
   
   /**
-   * @brief Read sensor data from robot
+   * @brief Read sensor data from robot (triggers CAN receive)
    * @param data Reference to SensorData structure to fill
    * @return true if sensor data read successfully, false otherwise
    */
   bool readSensors(SensorData& data);
-  
+
+  /**
+   * @brief Get ESC (wheel motor) data
+   * @param data Reference to EscData structure to fill
+   * @return true if data retrieved successfully, false otherwise
+   */
+  bool getEscData(EscData& data);
+
+  /**
+   * @brief Get IMU data
+   * @param data Reference to ImuData structure to fill
+   * @return true if data retrieved successfully, false otherwise
+   */
+  bool getImuData(ImuData& data);
+
+  /**
+   * @brief Get velocity data from motion controller
+   * @param data Reference to VelocityData structure to fill
+   * @return true if data retrieved successfully, false otherwise
+   */
+  bool getVelocityData(VelocityData& data);
+
+  /**
+   * @brief Get position data from motion controller
+   * @param data Reference to PositionData structure to fill
+   * @return true if data retrieved successfully, false otherwise
+   */
+  bool getPositionData(PositionData& data);
+
+  /**
+   * @brief Get attitude data
+   * @param data Reference to AttitudeData structure to fill
+   * @return true if data retrieved successfully, false otherwise
+   */
+  bool getAttitudeData(AttitudeData& data);
+
   /**
    * @brief Set LED color
    * @param r Red component (0-255)

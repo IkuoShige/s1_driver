@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 use anyhow::Result;
 
-use robomaster_rust::control::{RoboMaster, SensorData as RustSensorData, ImuData as RustImuData};
+use robomaster_rust::control::RoboMaster;
+use robomaster_rust::sensor::{SensorState, SharedSensorState};
 use robomaster_rust::command::{MovementParams as RustMovementParams, LedColor as RustLedColor};
 
 // C bool type definition
@@ -50,6 +51,62 @@ impl From<LedColor> for RustLedColor {
     }
 }
 
+/// ESC (wheel motor) data for FFI
+#[repr(C)]
+pub struct EscDataFFI {
+    /// Wheel speeds in rad/s [front-left, front-right, rear-left, rear-right]
+    pub speeds: [c_float; 4],
+    /// Wheel angles in radians
+    pub angles: [c_float; 4],
+    /// Data valid flag
+    pub has_data: c_bool,
+}
+
+/// IMU data for FFI
+#[repr(C)]
+pub struct ImuDataFFI {
+    /// Acceleration in m/s² [x, y, z]
+    pub accel: [c_float; 3],
+    /// Angular velocity in rad/s [x, y, z]
+    pub gyro: [c_float; 3],
+    /// Data valid flag
+    pub has_data: c_bool,
+}
+
+/// Velocity data for FFI
+#[repr(C)]
+pub struct VelocityDataFFI {
+    /// Body frame velocity [vx, vy, vz] in m/s
+    pub body: [c_float; 3],
+    /// Data valid flag
+    pub has_data: c_bool,
+}
+
+/// Position data for FFI
+#[repr(C)]
+pub struct PositionDataFFI {
+    /// Position [x, y, z] in meters
+    pub x: c_float,
+    pub y: c_float,
+    pub z: c_float,
+    /// Data valid flag
+    pub has_data: c_bool,
+}
+
+/// Attitude data for FFI
+#[repr(C)]
+pub struct AttitudeDataFFI {
+    /// Yaw angle in radians
+    pub yaw: c_float,
+    /// Pitch angle in radians
+    pub pitch: c_float,
+    /// Roll angle in radians
+    pub roll: c_float,
+    /// Data valid flag
+    pub has_data: c_bool,
+}
+
+/// Complete sensor data structure for FFI (legacy compatibility)
 #[repr(C)]
 pub struct SensorData {
     // IMU data
@@ -59,15 +116,15 @@ pub struct SensorData {
     pub gyro_x: c_float,
     pub gyro_y: c_float,
     pub gyro_z: c_float,
-    
-    // Motor feedback
+
+    // Motor feedback (rad/s)
     pub wheel_speeds: [c_float; 4],
-    
+
     // Battery status
     pub battery_voltage: c_float,
     pub battery_current: c_float,
     pub battery_temperature: c_float,
-    
+
     // System status
     pub is_connected: c_bool,
     pub timestamp_us: u64,
@@ -77,7 +134,7 @@ pub struct SensorData {
 pub struct RustBridgeHandle {
     pub robot: Option<Arc<Mutex<RoboMaster>>>,
     pub runtime: Runtime,
-    pub sensor_data: Option<RustSensorData>,
+    pub sensor_state: Option<SharedSensorState>,
 }
 
 impl RustBridgeHandle {
@@ -86,7 +143,7 @@ impl RustBridgeHandle {
         Ok(RustBridgeHandle {
             robot: None,
             runtime,
-            sensor_data: None,
+            sensor_state: None,
         })
     }
 }
@@ -171,12 +228,15 @@ pub extern "C" fn rust_bridge_initialize(handle_id: i32, interface: *const c_cha
     let result = handle.lock().unwrap().runtime.block_on(async move {
         let mut robot = RoboMaster::new(&interface_str).await?;
         robot.initialize().await?;
-        Ok::<RoboMaster, anyhow::Error>(robot)
+        let sensor_state = robot.get_shared_sensor_state();
+        Ok::<(RoboMaster, SharedSensorState), anyhow::Error>((robot, sensor_state))
     });
 
     match result {
-        Ok(robot) => {
-            handle.lock().unwrap().robot = Some(Arc::new(Mutex::new(robot)));
+        Ok((robot, sensor_state)) => {
+            let mut bridge = handle.lock().unwrap();
+            bridge.robot = Some(Arc::new(Mutex::new(robot)));
+            bridge.sensor_state = Some(sensor_state);
             1
         }
         Err(e) => {
@@ -386,25 +446,11 @@ pub extern "C" fn rust_bridge_read_sensor_data(handle_id: i32) -> c_bool {
     if let Some(robot_arc) = bridge.robot.clone() {
         let result = bridge.runtime.block_on(async move {
             let mut robot = robot_arc.lock().unwrap();
-            robot.receive_messages().await
+            robot.receive_sensor_data().await
         });
 
         match result {
-            Ok(_) => {
-                // Update stored sensor data - for now use default values
-                // TODO: Extract actual sensor data from robot state once available
-                bridge.sensor_data = Some(RustSensorData {
-                    battery_voltage: 12.0,
-                    current: 1.5,
-                    temperature: 25.0,
-                    imu: RustImuData {
-                        acceleration: [0.0, 0.0, 9.81],
-                        angular_velocity: [0.0, 0.0, 0.0],
-                        orientation: [0.0, 0.0, 0.0],
-                    },
-                });
-                1
-            }
+            Ok(_) => 1,
             Err(e) => {
                 eprintln!("Failed to receive sensor data: {}", e);
                 0
@@ -416,79 +462,251 @@ pub extern "C" fn rust_bridge_read_sensor_data(handle_id: i32) -> c_bool {
     }
 }
 
+/// Get ESC (wheel motor) data
+#[no_mangle]
+pub extern "C" fn rust_bridge_get_esc_data(handle_id: i32, data: *mut EscDataFFI) -> c_bool {
+    if data.is_null() {
+        return 0;
+    }
+
+    let handles = match HANDLES.lock() {
+        Ok(h) => h,
+        Err(_) => return 0,
+    };
+
+    let handle = match handles.get(handle_id as usize) {
+        Some(Some(h)) => h.clone(),
+        _ => return 0,
+    };
+
+    let bridge = match handle.lock() {
+        Ok(b) => b,
+        Err(_) => return 0,
+    };
+
+    if let Some(ref sensor_state) = bridge.sensor_state {
+        if let Ok(state) = sensor_state.read() {
+            let esc = &state.esc;
+            unsafe {
+                (*data).speeds = esc.speeds_rad_s();
+                (*data).angles = [
+                    esc.angle_rad(0),
+                    esc.angle_rad(1),
+                    esc.angle_rad(2),
+                    esc.angle_rad(3),
+                ];
+                (*data).has_data = if esc.has_data { 1 } else { 0 };
+            }
+            return 1;
+        }
+    }
+    0
+}
+
+/// Get IMU data
+#[no_mangle]
+pub extern "C" fn rust_bridge_get_imu_data_new(handle_id: i32, data: *mut ImuDataFFI) -> c_bool {
+    if data.is_null() {
+        return 0;
+    }
+
+    let handles = match HANDLES.lock() {
+        Ok(h) => h,
+        Err(_) => return 0,
+    };
+
+    let handle = match handles.get(handle_id as usize) {
+        Some(Some(h)) => h.clone(),
+        _ => return 0,
+    };
+
+    let bridge = match handle.lock() {
+        Ok(b) => b,
+        Err(_) => return 0,
+    };
+
+    if let Some(ref sensor_state) = bridge.sensor_state {
+        if let Ok(state) = sensor_state.read() {
+            let imu = &state.imu;
+            unsafe {
+                (*data).accel = imu.accel;
+                (*data).gyro = imu.gyro;
+                (*data).has_data = if imu.has_data { 1 } else { 0 };
+            }
+            return 1;
+        }
+    }
+    0
+}
+
+/// Get velocity data
+#[no_mangle]
+pub extern "C" fn rust_bridge_get_velocity_data(handle_id: i32, data: *mut VelocityDataFFI) -> c_bool {
+    if data.is_null() {
+        return 0;
+    }
+
+    let handles = match HANDLES.lock() {
+        Ok(h) => h,
+        Err(_) => return 0,
+    };
+
+    let handle = match handles.get(handle_id as usize) {
+        Some(Some(h)) => h.clone(),
+        _ => return 0,
+    };
+
+    let bridge = match handle.lock() {
+        Ok(b) => b,
+        Err(_) => return 0,
+    };
+
+    if let Some(ref sensor_state) = bridge.sensor_state {
+        if let Ok(state) = sensor_state.read() {
+            let velocity = &state.velocity;
+            unsafe {
+                (*data).body = velocity.body;
+                (*data).has_data = if velocity.has_data { 1 } else { 0 };
+            }
+            return 1;
+        }
+    }
+    0
+}
+
+/// Get position data
+#[no_mangle]
+pub extern "C" fn rust_bridge_get_position_data(handle_id: i32, data: *mut PositionDataFFI) -> c_bool {
+    if data.is_null() {
+        return 0;
+    }
+
+    let handles = match HANDLES.lock() {
+        Ok(h) => h,
+        Err(_) => return 0,
+    };
+
+    let handle = match handles.get(handle_id as usize) {
+        Some(Some(h)) => h.clone(),
+        _ => return 0,
+    };
+
+    let bridge = match handle.lock() {
+        Ok(b) => b,
+        Err(_) => return 0,
+    };
+
+    if let Some(ref sensor_state) = bridge.sensor_state {
+        if let Ok(state) = sensor_state.read() {
+            let position = &state.position;
+            unsafe {
+                (*data).x = position.x;
+                (*data).y = position.y;
+                (*data).z = position.z;
+                (*data).has_data = if position.has_data { 1 } else { 0 };
+            }
+            return 1;
+        }
+    }
+    0
+}
+
+/// Get attitude data
+#[no_mangle]
+pub extern "C" fn rust_bridge_get_attitude_data(handle_id: i32, data: *mut AttitudeDataFFI) -> c_bool {
+    if data.is_null() {
+        return 0;
+    }
+
+    let handles = match HANDLES.lock() {
+        Ok(h) => h,
+        Err(_) => return 0,
+    };
+
+    let handle = match handles.get(handle_id as usize) {
+        Some(Some(h)) => h.clone(),
+        _ => return 0,
+    };
+
+    let bridge = match handle.lock() {
+        Ok(b) => b,
+        Err(_) => return 0,
+    };
+
+    if let Some(ref sensor_state) = bridge.sensor_state {
+        if let Ok(state) = sensor_state.read() {
+            let attitude = &state.attitude;
+            unsafe {
+                (*data).yaw = attitude.yaw;
+                (*data).pitch = attitude.pitch;
+                (*data).roll = attitude.roll;
+                (*data).has_data = if attitude.has_data { 1 } else { 0 };
+            }
+            return 1;
+        }
+    }
+    0
+}
+
+/// Get battery level (legacy compatibility)
 #[no_mangle]
 pub extern "C" fn rust_bridge_get_battery_level(handle_id: i32) -> c_float {
     let handles = match HANDLES.lock() {
         Ok(h) => h,
-        Err(_) => {
-            eprintln!("Failed to lock handles mutex");
-            return 0.0;
-        }
+        Err(_) => return 0.0,
     };
 
     let handle = match handles.get(handle_id as usize) {
         Some(Some(h)) => h.clone(),
-        _ => {
-            eprintln!("Invalid handle ID: {}", handle_id);
-            return 0.0;
-        }
+        _ => return 0.0,
     };
 
     let bridge = match handle.lock() {
         Ok(b) => b,
-        Err(_) => {
-            eprintln!("Failed to lock bridge handle");
-            return 0.0;
-        }
+        Err(_) => return 0.0,
     };
 
-    if let Some(ref sensor_data) = bridge.sensor_data {
-        sensor_data.battery_voltage
-    } else {
-        eprintln!("No sensor data available");
-        0.0
+    if let Some(ref sensor_state) = bridge.sensor_state {
+        if let Ok(state) = sensor_state.read() {
+            return state.battery.adc as f32 / 1000.0; // Convert to voltage approximation
+        }
     }
+    0.0
 }
 
+/// Get IMU data (legacy compatibility)
 #[no_mangle]
-pub extern "C" fn rust_bridge_get_imu_data(handle_id: i32, 
-                                         acc_x: *mut c_float, acc_y: *mut c_float, acc_z: *mut c_float,
-                                         gyro_x: *mut c_float, gyro_y: *mut c_float, gyro_z: *mut c_float) -> c_bool {
+pub extern "C" fn rust_bridge_get_imu_data(
+    handle_id: i32,
+    acc_x: *mut c_float, acc_y: *mut c_float, acc_z: *mut c_float,
+    gyro_x: *mut c_float, gyro_y: *mut c_float, gyro_z: *mut c_float
+) -> c_bool {
     let handles = match HANDLES.lock() {
         Ok(h) => h,
-        Err(_) => {
-            eprintln!("Failed to lock handles mutex");
-            return 0;
-        }
+        Err(_) => return 0,
     };
 
     let handle = match handles.get(handle_id as usize) {
         Some(Some(h)) => h.clone(),
-        _ => {
-            eprintln!("Invalid handle ID: {}", handle_id);
-            return 0;
-        }
+        _ => return 0,
     };
 
     let bridge = match handle.lock() {
         Ok(b) => b,
-        Err(_) => {
-            eprintln!("Failed to lock bridge handle");
-            return 0;
-        }
+        Err(_) => return 0,
     };
 
-    if let Some(ref sensor_data) = bridge.sensor_data {
-        // Get actual IMU data from stored sensor data
-        if !acc_x.is_null() { unsafe { *acc_x = sensor_data.imu.acceleration[0]; } }
-        if !acc_y.is_null() { unsafe { *acc_y = sensor_data.imu.acceleration[1]; } }
-        if !acc_z.is_null() { unsafe { *acc_z = sensor_data.imu.acceleration[2]; } }
-        if !gyro_x.is_null() { unsafe { *gyro_x = sensor_data.imu.angular_velocity[0]; } }
-        if !gyro_y.is_null() { unsafe { *gyro_y = sensor_data.imu.angular_velocity[1]; } }
-        if !gyro_z.is_null() { unsafe { *gyro_z = sensor_data.imu.angular_velocity[2]; } }
-        1
-    } else {
-        eprintln!("No sensor data available");
-        0
+    if let Some(ref sensor_state) = bridge.sensor_state {
+        if let Ok(state) = sensor_state.read() {
+            let imu = &state.imu;
+            if !acc_x.is_null() { unsafe { *acc_x = imu.accel[0]; } }
+            if !acc_y.is_null() { unsafe { *acc_y = imu.accel[1]; } }
+            if !acc_z.is_null() { unsafe { *acc_z = imu.accel[2]; } }
+            if !gyro_x.is_null() { unsafe { *gyro_x = imu.gyro[0]; } }
+            if !gyro_y.is_null() { unsafe { *gyro_y = imu.gyro[1]; } }
+            if !gyro_z.is_null() { unsafe { *gyro_z = imu.gyro[2]; } }
+            return if imu.has_data { 1 } else { 0 };
+        }
     }
+    0
 }

@@ -15,6 +15,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <mutex>
 
 namespace s1_driver
 {
@@ -28,6 +29,7 @@ public:
 private:
   // Callback functions
   void cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg);
+  void livoxImuCallback(const sensor_msgs::msg::Imu::SharedPtr msg);
   void timerCallback();
   
   // CAN communication functions
@@ -43,9 +45,22 @@ private:
   
   // ROS2 publishers and subscribers
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr livox_imu_sub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_pub_;
+
+  // Livox IMU data
+  double livox_gyro_z_ = 0.0;
+  bool has_livox_imu_ = false;
+  std::mutex livox_imu_mutex_;
+
+  // Gyro bias calibration
+  double gyro_z_bias_ = 0.0;
+  double gyro_z_bias_sum_ = 0.0;
+  int gyro_calibration_count_ = 0;
+  bool gyro_calibrated_ = false;
+  static constexpr int GYRO_CALIBRATION_SAMPLES = 100;  // ~1 second at 100Hz
   
   // TF broadcaster
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
@@ -55,12 +70,25 @@ private:
   
   // Robot state variables
   struct RobotState {
-    double x, y, theta;           // Position and orientation
-    double vx, vy, vtheta;        // Velocities
-    double wheel_positions[4];    // Wheel positions [rad]
-    double wheel_velocities[4];   // Wheel velocities [rad/s]
-    double imu_accel[3];         // Linear acceleration [m/s²]
-    double imu_gyro[3];          // Angular velocity [rad/s]
+    double x = 0.0, y = 0.0, theta = 0.0;  // Position and orientation
+    double vx = 0.0, vy = 0.0, vtheta = 0.0;  // Velocities (body frame)
+    double wheel_positions[4] = {0};  // Wheel positions [rad]
+    double wheel_velocities[4] = {0};  // Wheel velocities [rad/s]
+    double imu_accel[3] = {0, 0, 9.81};  // Linear acceleration [m/s²]
+    double imu_gyro[3] = {0};  // Angular velocity [rad/s]
+
+    // Motion controller data
+    double controller_vx = 0.0, controller_vy = 0.0, controller_vz = 0.0;
+
+    // Attitude data
+    double roll = 0.0, pitch = 0.0, yaw = 0.0;
+
+    // Data availability flags
+    bool has_wheel_data = false;
+    bool has_imu_data = false;
+    bool has_controller_velocity = false;
+    bool has_attitude_data = false;
+
     rclcpp::Time timestamp;
   } robot_state_;
   

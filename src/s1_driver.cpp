@@ -43,11 +43,16 @@ S1Driver::S1Driver() : Node("s1_driver")
   imu_pub_ = this->create_publisher<sensor_msgs::msg::Imu>("imu/data", 10);
   joint_state_pub_ = this->create_publisher<sensor_msgs::msg::JointState>("joint_states", 10);
   
-  // Create subscriber
+  // Create subscribers
   cmd_vel_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
     "cmd_vel", 10,
     std::bind(&S1Driver::cmdVelCallback, this, std::placeholders::_1));
-  
+
+  // Subscribe to Livox IMU for yaw calculation
+  livox_imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
+    "/livox/imu", 10,
+    std::bind(&S1Driver::livoxImuCallback, this, std::placeholders::_1));
+
   // Create TF broadcaster
   if (publish_tf_) {
     tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
@@ -91,6 +96,32 @@ void S1Driver::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
   if (!sendMovementCommand(vx, vy, vz)) {
     RCLCPP_WARN(this->get_logger(), "Failed to send movement command");
   }
+}
+
+void S1Driver::livoxImuCallback(const sensor_msgs::msg::Imu::SharedPtr msg)
+{
+  std::lock_guard<std::mutex> lock(livox_imu_mutex_);
+
+  double raw_gyro_z = msg->angular_velocity.z;
+
+  // Calibration phase: collect samples to compute bias
+  if (!gyro_calibrated_) {
+    gyro_z_bias_sum_ += raw_gyro_z;
+    gyro_calibration_count_++;
+
+    if (gyro_calibration_count_ >= GYRO_CALIBRATION_SAMPLES) {
+      gyro_z_bias_ = gyro_z_bias_sum_ / gyro_calibration_count_;
+      gyro_calibrated_ = true;
+      RCLCPP_INFO(this->get_logger(),
+        "Gyro Z bias calibrated: %.6f rad/s (keep robot stationary during startup)",
+        gyro_z_bias_);
+    }
+    return;  // Don't use IMU data until calibrated
+  }
+
+  // Apply bias correction
+  livox_gyro_z_ = raw_gyro_z - gyro_z_bias_;
+  has_livox_imu_ = true;
 }
 
 void S1Driver::timerCallback()
@@ -181,7 +212,8 @@ bool S1Driver::readSensorData()
   if (!rust_bridge_ || !can_initialized_) {
     return false;
   }
-  
+
+  // Trigger sensor data receive from CAN
   SensorData sensor_data;
   if (!rust_bridge_->readSensors(sensor_data)) {
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -189,119 +221,256 @@ bool S1Driver::readSensorData()
                          rust_bridge_->getLastError().c_str());
     return false;
   }
-  
-  // Update robot state with sensor data
+
   robot_state_.timestamp = this->now();
-  robot_state_.imu_accel[0] = sensor_data.accel_x;
-  robot_state_.imu_accel[1] = sensor_data.accel_y;
-  robot_state_.imu_accel[2] = sensor_data.accel_z;
-  robot_state_.imu_gyro[0] = sensor_data.gyro_x;
-  robot_state_.imu_gyro[1] = sensor_data.gyro_y;
-  robot_state_.imu_gyro[2] = sensor_data.gyro_z;
-  
-  // Convert wheel speeds from rad/s to position integration (simple integration)
-  static auto last_time = robot_state_.timestamp;
-  double dt = (robot_state_.timestamp - last_time).seconds();
-  if (dt > 0) {
-    for (int i = 0; i < 4; ++i) {
-      robot_state_.wheel_velocities[i] = sensor_data.wheel_speeds[i];
-      robot_state_.wheel_positions[i] += sensor_data.wheel_speeds[i] * dt;
+
+  // Get ESC (wheel) data
+  EscData esc_data;
+  if (rust_bridge_->getEscData(esc_data)) {
+    if (esc_data.has_data) {
+      for (int i = 0; i < 4; ++i) {
+        robot_state_.wheel_velocities[i] = esc_data.speeds[i];
+        robot_state_.wheel_positions[i] = esc_data.angles[i];
+      }
+      robot_state_.has_wheel_data = true;
+      RCLCPP_DEBUG(this->get_logger(), "ESC: speeds=[%.2f, %.2f, %.2f, %.2f] rad/s",
+        robot_state_.wheel_velocities[0], robot_state_.wheel_velocities[1],
+        robot_state_.wheel_velocities[2], robot_state_.wheel_velocities[3]);
     }
   }
-  last_time = robot_state_.timestamp;
-  
-  // Simulate wheel encoder data
-  for (int i = 0; i < 4; ++i) {
-    robot_state_.wheel_velocities[i] = 0.0;  // Will be updated from real sensors
+
+  // Get IMU data
+  ImuData imu_data;
+  if (rust_bridge_->getImuData(imu_data) && imu_data.has_data) {
+    robot_state_.imu_accel[0] = imu_data.accel[0];
+    robot_state_.imu_accel[1] = imu_data.accel[1];
+    robot_state_.imu_accel[2] = imu_data.accel[2];
+    robot_state_.imu_gyro[0] = imu_data.gyro[0];
+    robot_state_.imu_gyro[1] = imu_data.gyro[1];
+    robot_state_.imu_gyro[2] = imu_data.gyro[2];
+    robot_state_.has_imu_data = true;
   }
-  
-  // Simulate IMU data
-  robot_state_.imu_accel[0] = 0.0;
-  robot_state_.imu_accel[1] = 0.0;
-  robot_state_.imu_accel[2] = 9.81;  // Gravity
-  
-  robot_state_.imu_gyro[0] = 0.0;
-  robot_state_.imu_gyro[1] = 0.0;
-  robot_state_.imu_gyro[2] = 0.0;
-  
+
+  // Get velocity data from motion controller (if available)
+  VelocityData vel_data;
+  if (rust_bridge_->getVelocityData(vel_data) && vel_data.has_data) {
+    robot_state_.controller_vx = vel_data.body[0];
+    robot_state_.controller_vy = vel_data.body[1];
+    robot_state_.controller_vz = vel_data.body[2];
+    robot_state_.has_controller_velocity = true;
+  }
+
+  // Get attitude data
+  AttitudeData attitude_data;
+  if (rust_bridge_->getAttitudeData(attitude_data) && attitude_data.has_data) {
+    robot_state_.roll = attitude_data.roll;
+    robot_state_.pitch = attitude_data.pitch;
+    robot_state_.yaw = attitude_data.yaw;
+    robot_state_.has_attitude_data = true;
+  }
+
   return true;
 }
 
 void S1Driver::updateOdometry()
 {
-  // TODO: Implement odometry calculation from wheel encoders
-  // This is a placeholder that maintains current position
-  
   auto current_time = robot_state_.timestamp;
   static auto last_time = current_time;
-  
+
   double dt = (current_time - last_time).seconds();
-  if (dt <= 0.0) return;
-  
-  // Placeholder odometry integration
-  robot_state_.x += robot_state_.vx * dt;
-  robot_state_.y += robot_state_.vy * dt;
-  robot_state_.theta += robot_state_.vtheta * dt;
-  
+  if (dt <= 0.0 || dt > 1.0) {
+    last_time = current_time;
+    return;
+  }
+
+  // Calculate velocities from wheel encoders using Mecanum kinematics
+  // Wheel order: [0]=FL, [1]=FR, [2]=RL, [3]=RR
+  // For Mecanum wheels:
+  //   vx = (w0 + w1 + w2 + w3) * R / 4
+  //   vy = (-w0 + w1 + w2 - w3) * R / 4
+  //   omega = (-w0 + w1 - w2 + w3) * R / (4 * (L + W))
+  // where R = wheel radius, L = half wheelbase length, W = half wheelbase width
+
+  if (robot_state_.has_wheel_data) {
+    double w0 = robot_state_.wheel_velocities[0];  // Front-left
+    double w1 = robot_state_.wheel_velocities[1];  // Front-right
+    double w2 = robot_state_.wheel_velocities[2];  // Rear-left
+    double w3 = robot_state_.wheel_velocities[3];  // Rear-right
+
+    // Mecanum forward kinematics (body frame velocities)
+    double vx_body = (w0 + w1 + w2 + w3) * WHEEL_RADIUS / 4.0;
+    double vy_body = (-w0 + w1 + w2 - w3) * WHEEL_RADIUS / 4.0;
+    double omega = (-w0 + w1 - w2 + w3) * WHEEL_RADIUS /
+                   (4.0 * (WHEEL_BASE_LENGTH / 2.0 + WHEEL_BASE_WIDTH / 2.0));
+
+    // Store body frame velocities
+    robot_state_.vx = vx_body;
+    robot_state_.vy = vy_body;
+    robot_state_.vtheta = omega;
+  } else if (robot_state_.has_controller_velocity) {
+    // Use velocity from motion controller if wheel data not available
+    // Sanity check: velocities should be within reasonable bounds (< 10 m/s)
+    double vx = robot_state_.controller_vx;
+    double vy = robot_state_.controller_vy;
+    double vz = robot_state_.controller_vz;  // Angular velocity from motion controller
+    if (std::isfinite(vx) && std::isfinite(vy) &&
+        std::abs(vx) < 10.0 && std::abs(vy) < 10.0) {
+      robot_state_.vx = vx;
+      robot_state_.vy = vy;
+      // Use vz from velocity data as angular velocity (body[2] contains omega)
+      if (std::isfinite(vz) && std::abs(vz) < 20.0) {
+        robot_state_.vtheta = vz;
+      } else if (robot_state_.has_imu_data) {
+        // Fallback to IMU gyro if vz is invalid
+        double vtheta = robot_state_.imu_gyro[2];
+        if (std::isfinite(vtheta) && std::abs(vtheta) < 20.0) {
+          robot_state_.vtheta = vtheta;
+        }
+      }
+    } else {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        "Invalid velocity data: vx=%.3f, vy=%.3f (filtering out)", vx, vy);
+      robot_state_.vx = 0.0;
+      robot_state_.vy = 0.0;
+      robot_state_.vtheta = 0.0;
+    }
+  }
+
+  // Override angular velocity with Livox IMU if available (more accurate for yaw)
+  {
+    std::lock_guard<std::mutex> lock(livox_imu_mutex_);
+    if (has_livox_imu_) {
+      if (std::isfinite(livox_gyro_z_) && std::abs(livox_gyro_z_) < 20.0) {
+        robot_state_.vtheta = livox_gyro_z_;
+      }
+    }
+  }
+
+  // Transform body velocities to global frame and integrate
+  double cos_theta = std::cos(robot_state_.theta);
+  double sin_theta = std::sin(robot_state_.theta);
+
+  double dx_global = (robot_state_.vx * cos_theta - robot_state_.vy * sin_theta) * dt;
+  double dy_global = (robot_state_.vx * sin_theta + robot_state_.vy * cos_theta) * dt;
+  double dtheta = robot_state_.vtheta * dt;
+
+  // Update pose
+  robot_state_.x += dx_global;
+  robot_state_.y += dy_global;
+  robot_state_.theta += dtheta;
+
+  // Normalize theta to [-PI, PI]
+  while (robot_state_.theta > M_PI) robot_state_.theta -= 2.0 * M_PI;
+  while (robot_state_.theta < -M_PI) robot_state_.theta += 2.0 * M_PI;
+
+  // Fallback: If Livox IMU not available and attitude data is available, use yaw directly
+  if (!has_livox_imu_ && robot_state_.has_attitude_data) {
+    double yaw = robot_state_.yaw;
+    // Sanity check: yaw should be within [-2*PI, 2*PI]
+    if (std::isfinite(yaw) && std::abs(yaw) < 2.0 * M_PI) {
+      robot_state_.theta = yaw;
+    }
+  }
+
   last_time = current_time;
 }
 
 void S1Driver::publishSensorData()
 {
   auto current_time = robot_state_.timestamp;
-  
+
   // Publish odometry
   auto odom_msg = nav_msgs::msg::Odometry();
   odom_msg.header.stamp = current_time;
   odom_msg.header.frame_id = odom_frame_;
   odom_msg.child_frame_id = base_frame_;
-  
+
   // Position
   odom_msg.pose.pose.position.x = robot_state_.x;
   odom_msg.pose.pose.position.y = robot_state_.y;
   odom_msg.pose.pose.position.z = 0.0;
-  
-  // Orientation
+
+  // Orientation (use roll/pitch if available)
   tf2::Quaternion q;
-  q.setRPY(0, 0, robot_state_.theta);
+  if (robot_state_.has_attitude_data) {
+    q.setRPY(robot_state_.roll, robot_state_.pitch, robot_state_.theta);
+  } else {
+    q.setRPY(0, 0, robot_state_.theta);
+  }
   odom_msg.pose.pose.orientation = tf2::toMsg(q);
-  
-  // Velocity
+
+  // Velocity (body frame)
   odom_msg.twist.twist.linear.x = robot_state_.vx;
   odom_msg.twist.twist.linear.y = robot_state_.vy;
   odom_msg.twist.twist.angular.z = robot_state_.vtheta;
-  
+
+  // Set covariance matrices (diagonal, values depend on sensor quality)
+  // Pose covariance: [x, y, z, roll, pitch, yaw]
+  odom_msg.pose.covariance[0] = 0.01;   // x variance
+  odom_msg.pose.covariance[7] = 0.01;   // y variance
+  odom_msg.pose.covariance[14] = 1e6;   // z variance (large, not measured)
+  odom_msg.pose.covariance[21] = 1e6;   // roll variance
+  odom_msg.pose.covariance[28] = 1e6;   // pitch variance
+  odom_msg.pose.covariance[35] = 0.03;  // yaw variance
+
+  // Twist covariance
+  odom_msg.twist.covariance[0] = 0.01;   // vx variance
+  odom_msg.twist.covariance[7] = 0.01;   // vy variance
+  odom_msg.twist.covariance[14] = 1e6;   // vz variance
+  odom_msg.twist.covariance[21] = 1e6;   // angular x variance
+  odom_msg.twist.covariance[28] = 1e6;   // angular y variance
+  odom_msg.twist.covariance[35] = 0.03;  // angular z variance
+
   odom_pub_->publish(odom_msg);
-  
+
   // Publish IMU data
   auto imu_msg = sensor_msgs::msg::Imu();
   imu_msg.header.stamp = current_time;
   imu_msg.header.frame_id = base_frame_;
-  
-  imu_msg.linear_acceleration.x = robot_state_.imu_accel[0];
-  imu_msg.linear_acceleration.y = robot_state_.imu_accel[1];
-  imu_msg.linear_acceleration.z = robot_state_.imu_accel[2];
-  
+
+  // Orientation from attitude if available
+  if (robot_state_.has_attitude_data) {
+    tf2::Quaternion imu_q;
+    imu_q.setRPY(robot_state_.roll, robot_state_.pitch, robot_state_.yaw);
+    imu_msg.orientation = tf2::toMsg(imu_q);
+    imu_msg.orientation_covariance[0] = 0.01;
+    imu_msg.orientation_covariance[4] = 0.01;
+    imu_msg.orientation_covariance[8] = 0.01;
+  } else {
+    // Orientation not available
+    imu_msg.orientation_covariance[0] = -1;
+  }
+
   imu_msg.angular_velocity.x = robot_state_.imu_gyro[0];
   imu_msg.angular_velocity.y = robot_state_.imu_gyro[1];
   imu_msg.angular_velocity.z = robot_state_.imu_gyro[2];
-  
+  imu_msg.angular_velocity_covariance[0] = 0.001;
+  imu_msg.angular_velocity_covariance[4] = 0.001;
+  imu_msg.angular_velocity_covariance[8] = 0.001;
+
+  imu_msg.linear_acceleration.x = robot_state_.imu_accel[0];
+  imu_msg.linear_acceleration.y = robot_state_.imu_accel[1];
+  imu_msg.linear_acceleration.z = robot_state_.imu_accel[2];
+  imu_msg.linear_acceleration_covariance[0] = 0.01;
+  imu_msg.linear_acceleration_covariance[4] = 0.01;
+  imu_msg.linear_acceleration_covariance[8] = 0.01;
+
   imu_pub_->publish(imu_msg);
-  
+
   // Publish joint states
   auto joint_msg = sensor_msgs::msg::JointState();
   joint_msg.header.stamp = current_time;
-  joint_msg.name = {"front_left_wheel_joint", "front_right_wheel_joint", 
+  joint_msg.name = {"front_left_wheel_joint", "front_right_wheel_joint",
                     "rear_left_wheel_joint", "rear_right_wheel_joint"};
-  
+
   joint_msg.position.resize(4);
   joint_msg.velocity.resize(4);
-  
+
   for (int i = 0; i < 4; ++i) {
     joint_msg.position[i] = robot_state_.wheel_positions[i];
     joint_msg.velocity[i] = robot_state_.wheel_velocities[i];
   }
-  
+
   joint_state_pub_->publish(joint_msg);
 }
 

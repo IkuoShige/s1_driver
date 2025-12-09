@@ -906,6 +906,7 @@ dependencies = [
  "clap 4.5.40",
  "futures",
  "gilrs",
+ "libc",
  "num-traits",
  "serde",
  "serde_json",
